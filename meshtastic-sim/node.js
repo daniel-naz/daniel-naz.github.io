@@ -2,17 +2,21 @@ import { global } from "./globals.js"
 import utils from "./utils.js"
 
 function createNodeModel() {
-    const modeltext = `<line x1="16" y1="80" x2="32" y2="32" stroke="black" stroke-width="2" fill="none"/>
-        <line x1="32" y1="32" x2="48" y2="80" stroke="black" stroke-width="2" fill="none"/>
-        <circle cx="32" cy="32" r="16" stroke="black" stroke-width="2" fill="none"/>
-        <circle cx="32" cy="32" r="22.627416997969522" stroke="black" stroke-width="2" fill="none"/>
-        <circle cx="32" cy="32" r="32" stroke="black" stroke-width="2" fill="none"/>
-        <line x1="16" y1="80" x2="48" y2="80" stroke="black" stroke-width="2" fill="none"/>`
+    const modeltext = `<line x1="-16" y1="48" x2="0" y2="0" stroke="black" stroke-width="2" fill="none"/>
+        <line x1="0" y1="0" x2="16" y2="48" stroke="black" stroke-width="2" fill="none"/>
+        <circle cx="0" cy="0" r="16" stroke="black" stroke-width="2" fill="none"/>
+        <circle cx="0" cy="0" r="24" stroke="black" stroke-width="2" fill="none"/>
+        <circle cx="0" cy="0" r="32" stroke="black" stroke-width="2" fill="none"/>
+        <circle cx="0" cy="0" r="40" fill="transparent"/>
+        <line x1="-16" y1="48" x2="16" y2="48" stroke="black" stroke-width="2" fill="none"/>`
 
     const element = utils.svg.createSvgFromText(modeltext)
     return element
 }
 
+/**
+ * @returns {SVGElement}
+ */
 function cloneModel() {
     return model.cloneNode(true)
 }
@@ -35,14 +39,39 @@ function generateNodeId() {
     return '!' + base64;
 }
 
+function onModelEnter(node) {
+    for (const e of nodeRangeModels) {
+        e.parentElement.removeChild(e)
+    }
+    nodeRangeModels.length = 0
+
+    const modeltext = `<circle cx="0" cy="0" r="${node.maxRangeKm() * global.GRID.SIZE}" fill="url(#grad1)"/>`
+    const element = utils.svg.createSvgFromText(modeltext)
+    element.setAttribute('transform', `translate(${node.position.x * 100}, ${node.position.y * 100})`)
+    nodeRangeModels.push(element)
+
+    const svg = node.model.parentElement
+    svg.insertBefore(element, svg.firstChild);
+}
+
+function onModelLeave() {
+    for (const e of nodeRangeModels) {
+        e.parentElement.removeChild(e)
+    }
+    nodeRangeModels.length = 0
+}
+
 const model = createNodeModel()
 
+const nodeRangeModels = []
+
 export class Node {
-    constructor(network, txDbm = 20, TTL = 600_000, position = { x: 0, y: 0 }) {
+    constructor(network, txDbm = 20, hops = 3, ignoretiming = true, position = { x: 0, y: 0 }) {
         this.id = generateNodeId()
 
         this.seenMessages = new Map()
-        this.ttl = TTL
+        this.ttl = 600_000
+        this.hops = hops
 
         this.network = network
         this.position = {
@@ -50,10 +79,28 @@ export class Node {
             y: position.y * global.GRID.SIZE,
         }
 
+        // not ignoring time (endless pain and suffering)
+        this.ignoretiming = ignoretiming
+        this.busy = false
+        this.busyuntil = 0
+
         this.model = cloneModel()
         this.model.setAttribute('transform', `scale(1) translate(${position.x * global.GRID.SIZE * 100}, ${position.y * global.GRID.SIZE * 100})`)
 
+        const node = this
+        this.model.addEventListener('mouseenter', (e) => {
+            onModelEnter(node)
+        })
+        this.model.addEventListener('mouseleave', (e) => {
+            onModelLeave()
+        })
         this.txDbm = txDbm
+    }
+
+    reset() {
+        this.busy = false;
+        this.busyuntil = 0
+        this.seenMessages.clear()
     }
 
     distanceTo(node) {
@@ -63,16 +110,15 @@ export class Node {
     }
 
     maxRangeKm() {
-        const PL_d0 = 32.44 + 20 * Math.log10(915); // FSPL at 1 m
-        const linkBudget = 20 + 0 + 0 - 2 - -130;
+        const PL_d0 = 32.44 + 20 * Math.log10(this.network.frequency); // FSPL at 1 m
+
+        const linkBudget = this.txDbm + 0 + 0 - 2 - this.network.sensitivity;
         const A_env = 30
 
-        const exponent = (linkBudget - PL_d0 - A_env) / (20 * 1);
-
+        const exponent = (linkBudget - PL_d0 - A_env) / (20);
         const d = Math.pow(10, exponent);
-        console.log(d);
-        
-        return d; // in km
+
+        return d;
     }
 
     canReach(node) {
@@ -80,18 +126,15 @@ export class Node {
         return dist <= this.maxRangeKm();
     }
 
-    send(receiverId) {
-        const msg = {
-            id: this.network.nextMessageId(),
-            from: this.id,
-            to: receiverId,
-            hops: 3,
-            payload: "hello",
-            timestamp: 100,
-        };
-
-        this.network.broadcast(this, msg)
+    decideIfBusy(ms) {
+        if (ms < this.busyuntil) {
+            this.busy = true;
+        }
+        else {
+            this.busy = false;
+        }
     }
+
 
     removeExpiredMessages(currentTime) {
         for (const [id, time] of this.seenMessages) {
@@ -110,18 +153,69 @@ export class Node {
         this.seenMessages.set(msg.id, 0)
     }
 
-    receive(msg) {
-        if (this.hasSeen(msg)) return;
-        this.markSeen(msg)
+    send(receiver, payload, ms) {
+        const msg = {
+            id: this.network.nextMessageId(),
+            from: this.id,
+            to: receiver.id,
+            hops: this.hops,
+            payload,
+            timestamp: ms,
+        };
 
-        if (msg.to == this.id) {
-            this.network.successes++
+        const sendtime = calculateTimeToSend(JSON.stringify(msg).length)
+
+        if (this.ignoretiming) {
+            this.network.broadcast(this, msg, ms)
             return true
         }
-        else if (msg.to != this.id && msg.hops > 1) {
-            msg = { ...msg, hops: msg.hops - 1 }
-            return this.network.broadcast(this, msg)
+        else {
+            this.decideIfBusy(ms)
+            if (!this.busy) {
+                this.busyuntil = ms + sendtime
+                this.network.broadcast(this, msg, ms + sendtime)
+                return true
+            }
         }
+
+        return false
+    }
+
+    receive(msg, ms) {
+        if (this.ignoretiming) {
+            if (this.hasSeen(msg)) return;
+            this.markSeen(msg)
+
+            if (msg.to == this.id) {
+                this.network.successes++
+                return true
+            }
+            else if (msg.to != this.id && msg.hops > 1) {
+                msg = { ...msg, hops: msg.hops - 1 }
+                return this.network.broadcast(this, msg, ms)
+            }
+        }
+        else {
+            const sendtime = calculateTimeToSend(JSON.stringify(msg).length)
+            this.decideIfBusy(ms)
+
+            if (!this.busy) {
+                if (this.hasSeen(msg)) return;
+                this.markSeen(msg)
+
+                this.busyuntil = ms + sendtime
+                // fix busy to stack up + add random delays
+                if (msg.to == this.id) {
+                    this.network.successes++
+                    return true
+                }
+                else if (msg.to != this.id && msg.hops > 1) {
+                    msg = { ...msg, hops: msg.hops - 1 }
+                    return this.network.broadcast(this, msg, this.busyuntil + sendtime)
+                }
+            }
+        }
+        return false
     }
 
     dispose() {
