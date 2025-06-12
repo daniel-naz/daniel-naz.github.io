@@ -166,7 +166,7 @@ utils.menu.createMenuDropdownButton('Simulation', 'Track packet', () => {
 
     const value = Number(result)
 
-    if (0 >= value || value >= 100) {
+    if (0 >= value || value >= currentProps.packets) {
         alert("Packet id out of range.")
         return
     }
